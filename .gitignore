@@ -1,0 +1,48 @@
+# Environment & Secrets
+.env
+.env*.local
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Logs & Traces
+logs/
+*.log
+*.jsonl
+
+# Agent & Workspace State
+.agent/
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Homelab-specific audits & personal notes
+docs/host-audit-*.md
+docs/codeserver-host-audit.md
+docs/cftunnel.md
+docs/microcoder*.md
+docs/netbox-report.md
+docs/report.md
+docs/vectordraw.md
+docs/portainer_docs/
+
+# Homelab-specific sync & scratch scripts
+subscripts/scratch_*.py
+subscripts/create_docker_page.py
+subscripts/update_compose_locations.py
+subscripts/update_portainer_pages.py
