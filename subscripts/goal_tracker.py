@@ -201,7 +201,11 @@ class GoalTracker:
             )
             return True
 
-        # If not multi-step, record prompt & attachments for context
+        # If not multi-step, still record prompt & attachments as primary objective for context & resteering
+        goal_summary = cleaned_text.split("\n")[0].strip()
+        if len(goal_summary) > 120:
+            goal_summary = goal_summary[:117] + "..."
+        self.goal = goal_summary
         self.last_user_prompt = user_input
         if attachments is not None:
             self.active_attachments = attachments
@@ -291,8 +295,10 @@ class GoalTracker:
             f"### 🎛️ USER RE-STEER DIRECTIVE\n\"{user_directive}\"\n",
             "### 🎯 ONGOING ACTIVE GOAL & CONTEXT",
         ]
-        if self.goal:
-            parts.append(f"**Primary Objective:** {self.goal}")
+        objective = self.goal or self.last_user_prompt or "Prior active task"
+        parts.append(f"**Primary Objective:** {objective}")
+        if self.last_user_prompt and self.last_user_prompt != objective:
+            parts.append(f"**Original Request:** \"{self.last_user_prompt}\"")
 
         if self.steps:
             parts.append("\n**Current Plan & Progress:**")

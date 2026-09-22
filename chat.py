@@ -902,9 +902,53 @@ def extract_embedded_tool_calls(text: str) -> Tuple[str, List[Dict[str, Any]]]:
                     })
         except Exception:
             pass
-    cleaned_text = p2.sub("", cleaned_text)
-
     return cleaned_text.strip(), tool_calls
+
+
+class RepetitionDetector:
+    """Detects degenerate token loops (repeated identical lines or cyclic n-grams) during streaming."""
+
+    def __init__(self, max_line_repeats: int = 4, max_ngram_repeats: int = 6, min_ngram_len: int = 15):
+        self.max_line_repeats = max_line_repeats
+        self.max_ngram_repeats = max_ngram_repeats
+        self.min_ngram_len = min_ngram_len
+        self.buffer = ""
+        self.recent_lines: List[str] = []
+
+    def push(self, token: str) -> bool:
+        """Pushes token into detector. Returns True if a degenerate loop is detected."""
+        if not token:
+            return False
+        self.buffer += token
+
+        # 1. Line-level repetition check
+        if "\n" in token:
+            lines = self.buffer.split("\n")
+            self.buffer = lines[-1]
+            for l in lines[:-1]:
+                cleaned = l.strip()
+                if len(cleaned) >= 3:
+                    if self.recent_lines and cleaned == self.recent_lines[-1]:
+                        self.recent_lines.append(cleaned)
+                        if len(self.recent_lines) >= self.max_line_repeats:
+                            return True
+                    else:
+                        self.recent_lines = [cleaned]
+
+        # 2. Substring / N-gram cyclic pattern check in tail of stream
+        tail = self.buffer[-300:] if len(self.buffer) > 300 else self.buffer
+        if len(tail) >= self.min_ngram_len * self.max_ngram_repeats:
+            for pat_len in range(self.min_ngram_len, 60):
+                pat = tail[-pat_len:]
+                matches = 0
+                idx = len(tail)
+                while idx >= pat_len and tail[idx - pat_len:idx] == pat:
+                    matches += 1
+                    idx -= pat_len
+                if matches >= self.max_ngram_repeats:
+                    return True
+
+        return False
 
 
 class ChatAgent:
@@ -915,7 +959,7 @@ class ChatAgent:
         executor: WikiToolExecutor,
         llm_url: Optional[str] = None,
         model: Optional[str] = None,
-        max_turns: int = 10,
+        max_turns: int = 20,
         logger: Optional[SessionLogger] = None,
         auto_approve: bool = False,
     ):
@@ -959,6 +1003,19 @@ class ChatAgent:
             "SYSTEM",
             f"Agent initialized with session_id={self.session_id}, model={self.model} ({self.model_status}), endpoint={self.llm_url}, max_turns={self.max_turns}"
         )
+
+    def _cleanup_interrupted_history(self):
+        """Clean up message history after an interrupt to preserve completed tool pairs while removing dangling incomplete calls."""
+        while self.messages:
+            last = self.messages[-1]
+            # If the last message is an assistant message with tool calls that never received tool responses, remove it
+            if last.get("role") == "assistant" and last.get("tool_calls"):
+                self.messages.pop()
+            # If the last message is an empty assistant message, remove it
+            elif last.get("role") == "assistant" and not last.get("content") and not last.get("tool_calls"):
+                self.messages.pop()
+            else:
+                break
 
     def _prune_history(self, max_tool_chars: int = 350):
         """Compact verbose tool outputs from prior conversation turns to preserve context window."""
@@ -1166,6 +1223,8 @@ class ChatAgent:
                     "tools": TOOLS_SPEC,
                     "tool_choice": "auto",
                     "temperature": 0.2,
+                    "frequency_penalty": float(os.getenv("LLM_FREQUENCY_PENALTY", "0.3")),
+                    "presence_penalty": float(os.getenv("LLM_PRESENCE_PENALTY", "0.1")),
                     "stream": True,
                 }
 
@@ -1176,6 +1235,8 @@ class ChatAgent:
                 reasoning_pieces: List[str] = []
                 tool_calls_dict: Dict[int, Dict[str, Any]] = {}
                 in_think_tag = False
+                loop_detector = RepetitionDetector()
+                loop_aborted = False
 
                 try:
                     resp = requests.post(
@@ -1207,6 +1268,9 @@ class ChatAgent:
                             if rc:
                                 reasoning_pieces.append(rc)
                                 streamer.push(rc)
+                                if loop_detector.push(rc):
+                                    loop_aborted = True
+                                    break
 
                             # 2. Content tokens (and <think> tag handling)
                             c = delta.get("content")
@@ -1221,25 +1285,40 @@ class ChatAgent:
                                             think_p, after_p = parts[1].split("</think>", 1)
                                             reasoning_pieces.append(think_p)
                                             streamer.push(think_p)
+                                            if loop_detector.push(think_p):
+                                                loop_aborted = True
+                                                break
                                             in_think_tag = False
                                             if after_p:
                                                 content_pieces.append(after_p)
                                         else:
                                             reasoning_pieces.append(parts[1])
                                             streamer.push(parts[1])
+                                            if loop_detector.push(parts[1]):
+                                                loop_aborted = True
+                                                break
                                 elif in_think_tag:
                                     if "</think>" in c:
                                         think_p, after_p = c.split("</think>", 1)
                                         reasoning_pieces.append(think_p)
                                         streamer.push(think_p)
+                                        if loop_detector.push(think_p):
+                                            loop_aborted = True
+                                            break
                                         in_think_tag = False
                                         if after_p:
                                             content_pieces.append(after_p)
                                     else:
                                         reasoning_pieces.append(c)
                                         streamer.push(c)
+                                        if loop_detector.push(c):
+                                            loop_aborted = True
+                                            break
                                 else:
                                     content_pieces.append(c)
+                                    if loop_detector.push(c):
+                                        loop_aborted = True
+                                        break
 
                             # 3. Tool call chunks
                             tcs = delta.get("tool_calls", [])
@@ -1258,6 +1337,11 @@ class ChatAgent:
                                         tool_calls_dict[idx]["name"] += tc["function"]["name"]
                                     if tc.get("function", {}).get("arguments"):
                                         tool_calls_dict[idx]["arguments"] += tc["function"]["arguments"]
+
+                    if loop_aborted:
+                        now_str = datetime.now().strftime("%H:%M:%S")
+                        print(f"\n  \033[90m[{now_str}]\033[0m \033[33m⚠ Degenerate repetition loop detected in model output (auto-aborted stream).\033[0m")
+                        self.logger.log("WARN", "Degenerate repetition loop detected in stream; auto-aborted.")
 
                 except Exception as e:
                     streamer.finish()
@@ -1446,6 +1530,8 @@ class ChatAgent:
             streamer = RollingThoughtStreamer("Synthesizing final summary", logger=self.logger)
             streamer.start()
             synth_pieces: List[str] = []
+            synth_detector = RepetitionDetector()
+            synth_aborted = False
             try:
                 resp = requests.post(
                     f"{self.llm_url}/chat/completions",
@@ -1453,6 +1539,8 @@ class ChatAgent:
                         "model": self.model,
                         "messages": self.messages,
                         "temperature": 0.3,
+                        "frequency_penalty": float(os.getenv("LLM_FREQUENCY_PENALTY", "0.3")),
+                        "presence_penalty": float(os.getenv("LLM_PRESENCE_PENALTY", "0.1")),
                         "stream": True,
                     },
                     stream=True,
@@ -1475,9 +1563,21 @@ class ChatAgent:
                         rc = delta.get("reasoning_content") or delta.get("reasoning")
                         if rc:
                             streamer.push(rc)
+                            if synth_detector.push(rc):
+                                synth_aborted = True
+                                break
                         c = delta.get("content")
                         if c:
                             synth_pieces.append(c)
+                            if synth_detector.push(c):
+                                synth_aborted = True
+                                break
+
+                if synth_aborted:
+                    now_str = datetime.now().strftime("%H:%M:%S")
+                    print(f"\n  \033[90m[{now_str}]\033[0m \033[33m⚠ Degenerate repetition loop detected in synthesis output (auto-aborted).\033[0m")
+                    self.logger.log("WARN", "Degenerate repetition loop detected in synthesis stream; auto-aborted.")
+
             except Exception as e:
                 streamer.finish()
                 streamer = None
@@ -1497,11 +1597,11 @@ class ChatAgent:
         except KeyboardInterrupt:
             if streamer:
                 streamer.finish(cancelled=True)
-            # Mark interrupted in goal tracker so the goal state and attachments are preserved for resteering
+            # Mark interrupted in goal tracker so the goal state, primary objective, and attachments are preserved
             self.goal_tracker.mark_interrupted()
-            self.messages = self.messages[:start_msg_count]
+            self._cleanup_interrupted_history()
             now_str = datetime.now().strftime("%H:%M:%S")
-            print(f"\n  \033[90m[{now_str}]\033[0m \033[1;33m⏹ Generation stopped by user.\033[0m Goal context preserved. You can enter a new prompt to resteer (e.g. \033[36m'try one page at a time'\033[0m).\n")
+            print(f"\n  \033[90m[{now_str}]\033[0m \033[1;33m⏹ Generation stopped by user.\033[0m Task context and gathered data preserved. You can enter a new prompt to resteer (e.g. \033[36m'try one page at a time'\033[0m).\n")
             self.logger.log("USER_INTERRUPT", "Generation stopped by user (Ctrl+C)")
             return None
 
@@ -1536,7 +1636,7 @@ Examples:
     parser.add_argument("prompt", nargs="?", help="Optional prompt to run non-interactively")
     parser.add_argument("--model", help="LLM model identifier (overrides LMSTUDIO_MODEL env)")
     parser.add_argument("--url", help="OpenAI-compatible LLM endpoint URL (overrides LMSTUDIO_URL env)")
-    parser.add_argument("--max-turns", type=int, default=10, help="Maximum tool interaction turns per query (default: 10)")
+    parser.add_argument("--max-turns", type=int, default=20, help="Maximum tool interaction turns per query (default: 20)")
     parser.add_argument("--yes", "-y", action="store_true", help="Auto-approve all mutating actions (page creation/updates) without interactive prompts")
 
     args = parser.parse_args()
